@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 openvpn_state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-openvpn"
-openvpn_runtime_dir="/tmp/omarchy-openvpn-$(id -u)"
+openvpn_runtime_base="${XDG_RUNTIME_DIR:-$openvpn_state_dir/runtime}"
+openvpn_runtime_dir="$openvpn_runtime_base/simpleopenvpn"
 openvpn_auth_dir="$openvpn_state_dir/auth"
 openvpn_config_file="$openvpn_state_dir/config"
 openvpn_config_dir_file="$openvpn_state_dir/config-dir"
@@ -11,10 +12,80 @@ openvpn_auth_file="$openvpn_runtime_dir/auth-user-pass"
 openvpn_pid_file="$openvpn_runtime_dir/openvpn.pid"
 openvpn_status_file="$openvpn_runtime_dir/openvpn.status"
 openvpn_log_file="$openvpn_runtime_dir/openvpn.log"
+openvpn_uid="$(id -u)"
+
+openvpn_fail() {
+  printf 'SimpleOpenVPN: %s\n' "$*" >&2
+  return 1
+}
+
+openvpn_validate_dir() {
+  local dir="$1" mode owner
+  [[ -d "$dir" ]] || openvpn_fail "not a directory: $dir" || return 1
+  [[ ! -L "$dir" ]] || openvpn_fail "refusing symlink directory: $dir" || return 1
+  owner=$(stat -c '%u' -- "$dir" 2>/dev/null) || return 1
+  [[ "$owner" == "$openvpn_uid" ]] || openvpn_fail "directory not owned by current user: $dir" || return 1
+  mode=$(stat -c '%a' -- "$dir" 2>/dev/null) || return 1
+  [[ "$mode" == "700" ]] || openvpn_fail "directory must be mode 700: $dir" || return 1
+}
+
+openvpn_prepare_dir() {
+  local dir="$1"
+  if [[ -e "$dir" && ( ! -d "$dir" || -L "$dir" ) ]]; then
+    openvpn_fail "refusing unsafe path: $dir" || return 1
+  fi
+  umask 077
+  mkdir -p -m 700 -- "$dir"
+  chmod 700 -- "$dir"
+  openvpn_validate_dir "$dir"
+}
+
+openvpn_validate_file() {
+  local file="$1" owner
+  [[ -e "$file" ]] || return 0
+  [[ -f "$file" && ! -L "$file" ]] || openvpn_fail "refusing unsafe file: $file" || return 1
+  owner=$(stat -c '%u' -- "$file" 2>/dev/null) || return 1
+  [[ "$owner" == "$openvpn_uid" ]] || openvpn_fail "file not owned by current user: $file" || return 1
+}
+
+openvpn_secure_truncate() {
+  local file="$1" dir
+  dir=$(dirname -- "$file")
+  openvpn_validate_dir "$dir" || return 1
+  openvpn_validate_file "$file" || return 1
+  umask 077
+  : > "$file"
+  chmod 600 -- "$file" 2>/dev/null || true
+}
+
+openvpn_secure_write_auth() {
+  local file="$1" username="$2" password="$3" dir
+  dir=$(dirname -- "$file")
+  openvpn_validate_dir "$dir" || return 1
+  openvpn_validate_file "$file" || return 1
+  umask 077
+  {
+    printf '%s\n' "$username"
+    printf '%s\n' "$password"
+  } > "$file"
+  chmod 600 -- "$file" 2>/dev/null || true
+}
+
+openvpn_secure_write_line() {
+  local file="$1" value="$2" dir
+  dir=$(dirname -- "$file")
+  openvpn_validate_dir "$dir" || return 1
+  openvpn_validate_file "$file" || return 1
+  umask 077
+  printf '%s\n' "$value" > "$file"
+  chmod 600 -- "$file" 2>/dev/null || true
+}
 
 openvpn_init_state() {
-  mkdir -p "$openvpn_state_dir" "$openvpn_auth_dir" "$openvpn_runtime_dir"
-  chmod 700 "$openvpn_state_dir" "$openvpn_auth_dir" "$openvpn_runtime_dir" 2>/dev/null || true
+  openvpn_prepare_dir "$openvpn_state_dir"
+  openvpn_prepare_dir "$openvpn_auth_dir"
+  openvpn_prepare_dir "$openvpn_runtime_base"
+  openvpn_prepare_dir "$openvpn_runtime_dir"
 }
 
 openvpn_profile_hash() {
@@ -53,10 +124,10 @@ openvpn_sync_runtime_auth() {
   local auth_f
   auth_f=$(openvpn_profile_auth_file "$target" 2>/dev/null || true)
   if [[ -n "$auth_f" && -s "$auth_f" ]]; then
-    mkdir -p "$openvpn_runtime_dir"
-    chmod 700 "$openvpn_runtime_dir" 2>/dev/null || true
-    umask 077
-    cp -f "$auth_f" "$openvpn_auth_file"
+    openvpn_validate_file "$auth_f" || return 1
+    openvpn_validate_dir "$openvpn_runtime_dir" || return 1
+    openvpn_validate_file "$openvpn_auth_file" || return 1
+    install -m 600 -- "$auth_f" "$openvpn_auth_file"
     chmod 600 "$openvpn_auth_file" 2>/dev/null || true
     return 0
   fi

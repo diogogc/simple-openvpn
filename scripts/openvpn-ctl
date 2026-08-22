@@ -117,8 +117,8 @@ connect)
 
   config_dir=$(dirname "$config")
   config_name=$(basename "$config")
-  : > "$openvpn_log_file"
-  : > "$openvpn_status_file"
+  openvpn_secure_truncate "$openvpn_log_file"
+  openvpn_secure_truncate "$openvpn_status_file"
 
   pkexec /bin/sh -c 'cd "$1" && umask 022 && if [ -s "$6" ]; then nohup openvpn --config "$2" --writepid "$3" --status "$4" 5 --auth-user-pass "$6" > "$5" 2>&1 & else nohup openvpn --config "$2" --writepid "$3" --status "$4" 5 > "$5" 2>&1 & fi' \
     openvpn-widget "$config_dir" "$config_name" "$openvpn_pid_file" "$openvpn_status_file" "$openvpn_log_file" "$openvpn_auth_file"
@@ -205,9 +205,12 @@ open_folder)
   ;;
 
 set_credentials)
-  uname=${1:?Usage: set_credentials <username> <password> [profile_path]}
-  passwd=${2:-}
-  target_conf=${3:-}
+  IFS= read -r uname || {
+    echo "Usage: set_credentials < username/password/profile on stdin >" >&2
+    exit 1
+  }
+  IFS= read -r passwd || passwd=""
+  IFS= read -r target_conf || target_conf=""
   if [[ -z "$target_conf" ]]; then
     target_conf=$(openvpn_selected_config 2>/dev/null || true)
   fi
@@ -216,26 +219,15 @@ set_credentials)
   if [[ -n "$target_conf" ]]; then
     auth_f=$(openvpn_profile_auth_file "$target_conf" 2>/dev/null || true)
     if [[ -n "$auth_f" ]]; then
-      umask 077
-      {
-        printf '%s\n' "$uname"
-        printf '%s\n' "$passwd"
-      } > "$auth_f"
-      chmod 600 "$auth_f" 2>/dev/null || true
+      openvpn_secure_write_auth "$auth_f" "$uname" "$passwd"
     fi
   fi
 
   # Save fallback/global username
-  printf '%s\n' "$uname" > "$openvpn_username_file"
-  chmod 600 "$openvpn_username_file" 2>/dev/null || true
+  openvpn_secure_write_line "$openvpn_username_file" "$uname"
 
   # Write runtime auth
-  umask 077
-  {
-    printf '%s\n' "$uname"
-    printf '%s\n' "$passwd"
-  } > "$openvpn_auth_file"
-  chmod 600 "$openvpn_auth_file" 2>/dev/null || true
+  openvpn_secure_write_auth "$openvpn_auth_file" "$uname" "$passwd"
   echo "ok"
   ;;
 

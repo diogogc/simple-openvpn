@@ -74,14 +74,14 @@ Item {
   }
 
   function setCredentials(user, pass) {
-    runControl("set_credentials", [user, pass, root.config])
+    runControl("set_credentials", [], user + "\n" + pass + "\n" + root.config + "\n")
   }
 
   function clearCredentials() {
     runControl("clear_credentials", [root.config])
   }
 
-  function runControl(action, extraArgs) {
+  function runControl(action, extraArgs, stdinData) {
     if (controlProc.running) return
     var cmd = [scriptPath, action]
     if (extraArgs && extraArgs.length > 0) {
@@ -89,6 +89,7 @@ Item {
         cmd.push(extraArgs[i])
       }
     }
+    controlProc.stdinData = stdinData || ""
     controlProc.command = cmd
     controlProc.running = true
   }
@@ -150,6 +151,14 @@ Item {
 
   Process {
     id: controlProc
+    property string stdinData: ""
+    stdinEnabled: true
+    onStarted: {
+      if (stdinData !== "") {
+        write(stdinData)
+        stdinData = ""
+      }
+    }
     onRunningChanged: {
       if (!running) {
         Qt.callLater(function() { root.refresh() })
