@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.diogogc.simple-openvpn",
+  "name": "SimpleOpenVPN",
+  "version": "1.0.0",
+  "author": "Diogo",
+  "license": "MIT",
+  "description": "Simple OpenVPN toggle switch, profile selector, credentials manager, and live stats in the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "SimpleOpenVPN",
+    "description": "Toggle OpenVPN connection, switch profiles, manage credentials, and view stats.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

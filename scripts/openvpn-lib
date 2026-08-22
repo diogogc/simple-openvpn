@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+
+openvpn_state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-openvpn"
+openvpn_runtime_dir="/tmp/omarchy-openvpn-$(id -u)"
+openvpn_auth_dir="$openvpn_state_dir/auth"
+openvpn_config_file="$openvpn_state_dir/config"
+openvpn_config_dir_file="$openvpn_state_dir/config-dir"
+openvpn_profiles_file="$openvpn_state_dir/profiles"
+openvpn_username_file="$openvpn_state_dir/username"
+openvpn_auth_file="$openvpn_runtime_dir/auth-user-pass"
+openvpn_pid_file="$openvpn_runtime_dir/openvpn.pid"
+openvpn_status_file="$openvpn_runtime_dir/openvpn.status"
+openvpn_log_file="$openvpn_runtime_dir/openvpn.log"
+
+openvpn_init_state() {
+  mkdir -p "$openvpn_state_dir" "$openvpn_auth_dir" "$openvpn_runtime_dir"
+  chmod 700 "$openvpn_state_dir" "$openvpn_auth_dir" "$openvpn_runtime_dir" 2>/dev/null || true
+}
+
+openvpn_profile_hash() {
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    target=$(openvpn_selected_config 2>/dev/null || true)
+  fi
+  [[ -n "$target" ]] || return 1
+  printf '%s' "$target" | md5sum | awk '{ print $1 }'
+}
+
+openvpn_profile_auth_file() {
+  local target="${1:-}"
+  local h
+  h=$(openvpn_profile_hash "$target" 2>/dev/null) || return 1
+  printf '%s/%s.auth\n' "$openvpn_auth_dir" "$h"
+}
+
+openvpn_profile_username() {
+  local target="${1:-}"
+  local auth_f
+  auth_f=$(openvpn_profile_auth_file "$target" 2>/dev/null) || return 1
+  [[ -r "$auth_f" ]] || return 1
+  sed -n '1p' "$auth_f"
+}
+
+openvpn_profile_has_auth() {
+  local target="${1:-}"
+  local auth_f
+  auth_f=$(openvpn_profile_auth_file "$target" 2>/dev/null) || return 1
+  [[ -s "$auth_f" ]]
+}
+
+openvpn_sync_runtime_auth() {
+  local target="${1:-}"
+  local auth_f
+  auth_f=$(openvpn_profile_auth_file "$target" 2>/dev/null || true)
+  if [[ -n "$auth_f" && -s "$auth_f" ]]; then
+    mkdir -p "$openvpn_runtime_dir"
+    chmod 700 "$openvpn_runtime_dir" 2>/dev/null || true
+    umask 077
+    cp -f "$auth_f" "$openvpn_auth_file"
+    chmod 600 "$openvpn_auth_file" 2>/dev/null || true
+    return 0
+  fi
+  return 1
+}
+
+openvpn_selected_config() {
+  [[ -r "$openvpn_config_file" ]] || return 1
+  sed -n '1p' "$openvpn_config_file"
+}
+
+openvpn_selected_dir() {
+  if [[ -r "$openvpn_config_dir_file" ]]; then
+    sed -n '1p' "$openvpn_config_dir_file"
+  else
+    printf '%s\n' "$HOME"
+  fi
+}
+
+openvpn_remember_profile() {
+  local target="$1" tmp
+  [[ -n "$target" && -r "$target" ]] || return 1
+  tmp=$(mktemp)
+  {
+    [[ -r "$openvpn_profiles_file" ]] && sed '/^[[:space:]]*$/d' "$openvpn_profiles_file"
+    printf '%s\n' "$target"
+  } | awk '!seen[$0]++' > "$tmp"
+  mv "$tmp" "$openvpn_profiles_file"
+  chmod 600 "$openvpn_profiles_file" 2>/dev/null || true
+}
+
+openvpn_known_profiles() {
+  [[ -r "$openvpn_profiles_file" ]] || return 0
+  while IFS= read -r profile; do
+    [[ -n "$profile" && -r "$profile" ]] && printf '%s\n' "$profile"
+  done < "$openvpn_profiles_file"
+}
+
+openvpn_username() {
+  local u
+  u=$(openvpn_profile_username 2>/dev/null || true)
+  if [[ -n "$u" ]]; then
+    printf '%s\n' "$u"
+    return 0
+  fi
+  [[ -r "$openvpn_username_file" ]] || return 1
+  sed -n '1p' "$openvpn_username_file"
+}
+
+openvpn_has_auth() {
+  [[ -s "$openvpn_auth_file" ]] || openvpn_profile_has_auth
+}
+
+openvpn_pid() {
+  [[ -r "$openvpn_pid_file" ]] || return 1
+  sed -n '1p' "$openvpn_pid_file"
+}
+
+openvpn_pid_is_openvpn() {
+  local pid="$1" comm
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ -d "/proc/$pid" ]] || return 1
+  comm=$(ps -p "$pid" -o comm= 2>/dev/null | awk '{ print $1 }')
+  [[ "$comm" == "openvpn" ]]
+}
+
+openvpn_matching_pids() {
+  ps -eo pid=,comm=,args= 2>/dev/null | awk -v pid_file="$openvpn_pid_file" '
+    $2 == "openvpn" && index($0, "--writepid " pid_file) { print $1 }
+  '
+}
+
+openvpn_is_running() {
+  local pid
+  pid=$(openvpn_pid 2>/dev/null || true)
+  if [[ "$pid" =~ ^[0-9]+$ ]]; then
+    openvpn_pid_is_openvpn "$pid" && return 0
+  fi
+  [[ -n "$(openvpn_matching_pids)" ]]
+}
+
+openvpn_tun_iface() {
+  ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^(tun|tap)[0-9]+$/ { print $2; exit }'
+}
+
+openvpn_bytes_text() {
+  local iface="$1" rx tx
+  [[ -n "$iface" ]] || return 1
+  rx=$(cat "/sys/class/net/$iface/statistics/rx_bytes" 2>/dev/null) || return 1
+  tx=$(cat "/sys/class/net/$iface/statistics/tx_bytes" 2>/dev/null) || return 1
+  awk -v rx="$rx" -v tx="$tx" '
+    function human(bytes) {
+      split("B KiB MiB GiB TiB", units, " ")
+      value = bytes + 0
+      unit_index = 1
+      while (value >= 1024 && unit_index < 5) {
+        value = value / 1024
+        unit_index++
+      }
+      if (unit_index == 1) return sprintf("%d%s", value, units[unit_index])
+      return sprintf("%.1f%s", value, units[unit_index])
+    }
+    BEGIN { printf "rx %s tx %s", human(rx), human(tx) }
+  '
+}
+
+openvpn_status_summary() {
+  [[ -r "$openvpn_status_file" ]] || return 1
+  awk -F, '
+    $1 == "TITLE" { title = $2 }
+    $1 == "TIME" { updated = $2 }
+    $1 == "SUCCESS" { success = $2 }
+    END {
+      if (success != "") print success
+      else if (updated != "") print "updated " updated
+      else if (title != "") print title
+    }
+  ' "$openvpn_status_file"
+}

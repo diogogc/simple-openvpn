@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$script_dir/openvpn-lib"
+openvpn_init_state
+
+cmd=${1:-status}
+shift || true
+
+case "$cmd" in
+status)
+  config=$(openvpn_selected_config 2>/dev/null || true)
+  config_name=""
+  [[ -n "$config" ]] && config_name=$(basename "$config")
+  config_dir=$(openvpn_selected_dir 2>/dev/null || true)
+  [[ -z "$config_dir" && -n "$config" ]] && config_dir=$(dirname "$config")
+  [[ -z "$config_dir" ]] && config_dir="$HOME"
+
+  configs_json="[]"
+  auth_configs_json="[]"
+	  mapfile -t saved_profiles < <(openvpn_known_profiles)
+	  if [[ -d "$config_dir" ]]; then
+	    mapfile -t conf_list < <(
+	      {
+	        printf '%s\n' "${saved_profiles[@]}"
+	        find "$config_dir" -maxdepth 2 -type f \( -name '*.ovpn' -o -name '*.conf' \) 2>/dev/null
+	      } | grep -E '\.(ovpn|conf)$' | sort -u
+	    )
+	  else
+	    conf_list=("${saved_profiles[@]}")
+	  fi
+	  if ((${#conf_list[@]} > 0)); then
+	    configs_json=$(printf '%s\n' "${conf_list[@]}" | jq -R . | jq -s .)
+
+	    auth_list=()
+	    for c in "${conf_list[@]}"; do
+	      if openvpn_profile_has_auth "$c"; then
+	        auth_list+=("$c")
+	      fi
+	    done
+	    if ((${#auth_list[@]} > 0)); then
+	      auth_configs_json=$(printf '%s\n' "${auth_list[@]}" | jq -R . | jq -s .)
+	    fi
+	  fi
+
+  is_running=false
+  if openvpn_is_running; then
+    is_running=true
+  fi
+
+  iface=$(openvpn_tun_iface || true)
+  ip_addr=""
+  [[ -n "$iface" ]] && ip_addr=$(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{ print $4; exit }' || true)
+
+  bytes=""
+  [[ -n "$iface" ]] && bytes=$(openvpn_bytes_text "$iface" 2>/dev/null || true)
+
+  # Check credentials for active profile
+  has_auth=false
+  if openvpn_has_auth; then
+    has_auth=true
+  fi
+
+  uname=$(openvpn_username 2>/dev/null || true)
+
+  summary=$(openvpn_status_summary 2>/dev/null || true)
+
+  log_tail=""
+  if [[ -r "$openvpn_log_file" ]]; then
+    log_tail=$(tail -n 12 "$openvpn_log_file" 2>/dev/null || true)
+  fi
+
+  jq -n \
+    --argjson connected "$is_running" \
+    --arg iface "${iface:-}" \
+    --arg ip "${ip_addr:-}" \
+    --arg config "${config:-}" \
+    --arg config_name "${config_name:-}" \
+    --arg config_dir "${config_dir:-}" \
+    --argjson configs "$configs_json" \
+    --argjson auth_configs "$auth_configs_json" \
+    --argjson has_auth "$has_auth" \
+    --arg username "${uname:-}" \
+    --arg bytes_text "${bytes:-}" \
+    --arg status_summary "${summary:-}" \
+    --arg log_tail "${log_tail:-}" \
+    '{
+      connected: $connected,
+      iface: $iface,
+      ip: $ip,
+      config: $config,
+      config_name: $config_name,
+      config_dir: $config_dir,
+      configs: $configs,
+      auth_configs: $auth_configs,
+      has_auth: $has_auth,
+      username: $username,
+      bytes_text: $bytes_text,
+      status_summary: $status_summary,
+      log_tail: $log_tail
+    }'
+  ;;
+
+connect)
+  config=$(openvpn_selected_config 2>/dev/null || true)
+  if [[ -z "$config" || ! -r "$config" ]]; then
+    echo "No valid config selected" >&2
+    exit 1
+  fi
+  if openvpn_is_running; then
+    echo "Already running"
+    exit 0
+  fi
+  # Make sure runtime auth is synced from profile auth
+  openvpn_sync_runtime_auth "$config" || true
+
+  config_dir=$(dirname "$config")
+  config_name=$(basename "$config")
+  : > "$openvpn_log_file"
+  : > "$openvpn_status_file"
+
+  pkexec /bin/sh -c 'cd "$1" && umask 022 && if [ -s "$6" ]; then nohup openvpn --config "$2" --writepid "$3" --status "$4" 5 --auth-user-pass "$6" > "$5" 2>&1 & else nohup openvpn --config "$2" --writepid "$3" --status "$4" 5 > "$5" 2>&1 & fi' \
+    openvpn-widget "$config_dir" "$config_name" "$openvpn_pid_file" "$openvpn_status_file" "$openvpn_log_file" "$openvpn_auth_file"
+  echo "connected"
+  ;;
+
+disconnect)
+  if ! openvpn_is_running; then
+    echo "Not running"
+    exit 0
+  fi
+  pids=$(openvpn_matching_pids)
+  if [[ -z "$pids" ]]; then
+    pids=$(openvpn_pid 2>/dev/null || true)
+  fi
+  if [[ -n "$pids" ]]; then
+    pkexec /bin/sh -c 'for pid in "$@"; do kill "$pid" 2>/dev/null || true; done' openvpn-widget $pids
+  fi
+  rm -f "$openvpn_auth_file"
+  echo "disconnected"
+  ;;
+
+toggle)
+  if openvpn_is_running; then
+    "$0" disconnect
+  else
+    "$0" connect
+  fi
+  ;;
+
+set_config)
+  new_conf=${1:?Usage: set_config <path>}
+  if [[ ! -r "$new_conf" ]]; then
+    echo "File unreadable: $new_conf" >&2
+    exit 1
+  fi
+	  printf '%s\n' "$new_conf" > "$openvpn_config_file"
+	  printf '%s\n' "$(dirname "$new_conf")" > "$openvpn_config_dir_file"
+	  openvpn_remember_profile "$new_conf"
+	  # Sync saved auth for this profile to runtime
+	  openvpn_sync_runtime_auth "$new_conf" || rm -f "$openvpn_auth_file"
+	  echo "ok"
+	  ;;
+
+set_config_dir)
+  new_dir=${1:?Usage: set_config_dir <path>}
+  new_dir="${new_dir/#\~/$HOME}"
+  if [[ ! -d "$new_dir" ]]; then
+    echo "Directory not found: $new_dir" >&2
+    exit 1
+  fi
+  printf '%s\n' "$new_dir" > "$openvpn_config_dir_file"
+  echo "ok"
+  ;;
+
+	pick_file|add_profile)
+	  file=""
+	  if command -v zenity &>/dev/null; then
+	    file=$(zenity --file-selection --title="Add OpenVPN Profile" --file-filter="OpenVPN Config (*.ovpn *.conf) | *.ovpn *.conf" 2>/dev/null || true)
+	  elif command -v omarchy-file-select &>/dev/null; then
+	    file=$(omarchy-file-select --title "Add OpenVPN Profile" --extensions "ovpn conf" 2>/dev/null || true)
+	  fi
+
+	  if [[ -n "$file" && -r "$file" ]]; then
+	    printf '%s\n' "$file" > "$openvpn_config_file"
+	    printf '%s\n' "$(dirname "$file")" > "$openvpn_config_dir_file"
+	    openvpn_remember_profile "$file"
+	    openvpn_sync_runtime_auth "$file" || rm -f "$openvpn_auth_file"
+	    echo "$file"
+  else
+    echo "cancelled"
+  fi
+  ;;
+
+open_folder)
+  dir=$(openvpn_selected_dir 2>/dev/null || true)
+  [[ -z "$dir" ]] && dir="$HOME"
+  if command -v nautilus &>/dev/null; then
+    nautilus "$dir" &>/dev/null &
+  elif command -v xdg-open &>/dev/null; then
+    xdg-open "$dir" &>/dev/null &
+  fi
+  echo "ok"
+  ;;
+
+set_credentials)
+  uname=${1:?Usage: set_credentials <username> <password> [profile_path]}
+  passwd=${2:-}
+  target_conf=${3:-}
+  if [[ -z "$target_conf" ]]; then
+    target_conf=$(openvpn_selected_config 2>/dev/null || true)
+  fi
+
+  # Save profile-specific auth file
+  if [[ -n "$target_conf" ]]; then
+    auth_f=$(openvpn_profile_auth_file "$target_conf" 2>/dev/null || true)
+    if [[ -n "$auth_f" ]]; then
+      umask 077
+      {
+        printf '%s\n' "$uname"
+        printf '%s\n' "$passwd"
+      } > "$auth_f"
+      chmod 600 "$auth_f" 2>/dev/null || true
+    fi
+  fi
+
+  # Save fallback/global username
+  printf '%s\n' "$uname" > "$openvpn_username_file"
+  chmod 600 "$openvpn_username_file" 2>/dev/null || true
+
+  # Write runtime auth
+  umask 077
+  {
+    printf '%s\n' "$uname"
+    printf '%s\n' "$passwd"
+  } > "$openvpn_auth_file"
+  chmod 600 "$openvpn_auth_file" 2>/dev/null || true
+  echo "ok"
+  ;;
+
+clear_credentials)
+  target_conf=${1:-}
+  if [[ -z "$target_conf" ]]; then
+    target_conf=$(openvpn_selected_config 2>/dev/null || true)
+  fi
+
+  if [[ -n "$target_conf" ]]; then
+    auth_f=$(openvpn_profile_auth_file "$target_conf" 2>/dev/null || true)
+    [[ -n "$auth_f" ]] && rm -f "$auth_f"
+  fi
+  rm -f "$openvpn_auth_file"
+  echo "ok"
+  ;;
+
+*)
+  echo "Unknown command: $cmd" >&2
+  exit 1
+  ;;
+esac
