@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 
 openvpn_state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-openvpn"
-openvpn_runtime_base="${XDG_RUNTIME_DIR:-$openvpn_state_dir/runtime}"
-openvpn_runtime_dir="$openvpn_runtime_base/simpleopenvpn"
+openvpn_runtime_dir="/run/simpleopenvpn-$(id -u)"
 openvpn_auth_dir="$openvpn_state_dir/auth"
 openvpn_config_file="$openvpn_state_dir/config"
 openvpn_config_dir_file="$openvpn_state_dir/config-dir"
@@ -13,6 +12,7 @@ openvpn_pid_file="$openvpn_runtime_dir/openvpn.pid"
 openvpn_status_file="$openvpn_runtime_dir/openvpn.status"
 openvpn_log_file="$openvpn_runtime_dir/openvpn.log"
 openvpn_uid="$(id -u)"
+openvpn_gid="$(id -g)"
 
 openvpn_fail() {
   printf 'SimpleOpenVPN: %s\n' "$*" >&2
@@ -52,26 +52,50 @@ openvpn_atomic_publish() {
   local file="$1" dir base
   dir=$(dirname -- "$file")
   base=$(basename -- "$file")
-  openvpn_validate_dir "$dir" || return 1
 
   command -v python3 >/dev/null 2>&1 || openvpn_fail "python3 is required for secure file writes" || return 1
+  # Keep the validated directory open and perform all path operations relative
+  # to that descriptor. This avoids check-then-use races if the directory path
+  # is replaced after validation.
   python3 -c '
 import os
 import secrets
+import stat
 import sys
 
-directory, basename, destination = sys.argv[1:]
+directory, basename, uid_text = sys.argv[1:]
+uid = int(uid_text)
+if basename != os.path.basename(basename) or basename in ("", ".", ".."):
+    raise SystemExit("SimpleOpenVPN: invalid target filename")
+
+dir_flags = os.O_RDONLY
+if hasattr(os, "O_DIRECTORY"):
+    dir_flags |= os.O_DIRECTORY
+if hasattr(os, "O_NOFOLLOW"):
+    dir_flags |= os.O_NOFOLLOW
+
 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
 if hasattr(os, "O_NOFOLLOW"):
     flags |= os.O_NOFOLLOW
 
 tmp = None
 fd = None
+dir_fd = None
 try:
+    dir_fd = os.open(directory, dir_flags)
+    dir_stat = os.fstat(dir_fd)
+    if not stat.S_ISDIR(dir_stat.st_mode):
+        raise NotADirectoryError(directory)
+    if dir_stat.st_uid != uid:
+        raise PermissionError(f"directory not owned by current user: {directory}")
+    if stat.S_IMODE(dir_stat.st_mode) != 0o700:
+        raise PermissionError(f"directory must be mode 700: {directory}")
+
+    # Create and publish inside dir_fd, never by resolving directory again.
     for _ in range(100):
-        candidate = os.path.join(directory, f".{basename}.tmp.{secrets.token_hex(8)}")
+        candidate = f".{basename}.tmp.{secrets.token_hex(8)}"
         try:
-            fd = os.open(candidate, flags, 0o600)
+            fd = os.open(candidate, flags, 0o600, dir_fd=dir_fd)
             tmp = candidate
             break
         except FileExistsError:
@@ -89,7 +113,8 @@ try:
         handle.flush()
         os.fsync(handle.fileno())
 
-    os.replace(tmp, destination)
+    os.replace(tmp, basename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    os.fsync(dir_fd)
     tmp = None
 except Exception as exc:
     print(f"SimpleOpenVPN: secure write failed: {exc}", file=sys.stderr)
@@ -97,12 +122,14 @@ except Exception as exc:
 finally:
     if fd is not None:
         os.close(fd)
-    if tmp is not None:
+    if tmp is not None and dir_fd is not None:
         try:
-            os.unlink(tmp)
+            os.unlink(tmp, dir_fd=dir_fd)
         except FileNotFoundError:
             pass
-' "$dir" "$base" "$file"
+    if dir_fd is not None:
+        os.close(dir_fd)
+' "$dir" "$base" "$openvpn_uid"
 }
 
 openvpn_secure_truncate() {
@@ -125,16 +152,107 @@ openvpn_secure_write_line() {
 
 openvpn_secure_copy_file() {
   local src="$1" dest="$2"
-  openvpn_validate_file "$src" || return 1
-  [[ -r "$src" ]] || return 1
-  cat -- "$src" | openvpn_atomic_publish "$dest"
+  local dir base
+  dir=$(dirname -- "$dest")
+  base=$(basename -- "$dest")
+
+  command -v python3 >/dev/null 2>&1 || openvpn_fail "python3 is required for secure file writes" || return 1
+  # Hold both the source file descriptor and destination directory descriptor
+  # after validation. Copying from/to those descriptors avoids source reopens and
+  # destination directory replacement races.
+  python3 -c '
+import os
+import secrets
+import stat
+import sys
+
+source, directory, basename, uid_text = sys.argv[1:]
+uid = int(uid_text)
+if basename != os.path.basename(basename) or basename in ("", ".", ".."):
+    raise SystemExit("SimpleOpenVPN: invalid target filename")
+
+read_flags = os.O_RDONLY
+dir_flags = os.O_RDONLY
+if hasattr(os, "O_DIRECTORY"):
+    dir_flags |= os.O_DIRECTORY
+if hasattr(os, "O_NOFOLLOW"):
+    read_flags |= os.O_NOFOLLOW
+    dir_flags |= os.O_NOFOLLOW
+
+write_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, "O_NOFOLLOW"):
+    write_flags |= os.O_NOFOLLOW
+
+src_fd = None
+dir_fd = None
+tmp_fd = None
+tmp = None
+try:
+    src_fd = os.open(source, read_flags)
+    src_stat = os.fstat(src_fd)
+    if not stat.S_ISREG(src_stat.st_mode):
+        raise OSError(f"not a regular file: {source}")
+    if src_stat.st_uid != uid:
+        raise PermissionError(f"file not owned by current user: {source}")
+
+    dir_fd = os.open(directory, dir_flags)
+    dir_stat = os.fstat(dir_fd)
+    if not stat.S_ISDIR(dir_stat.st_mode):
+        raise NotADirectoryError(directory)
+    if dir_stat.st_uid != uid:
+        raise PermissionError(f"directory not owned by current user: {directory}")
+    if stat.S_IMODE(dir_stat.st_mode) != 0o700:
+        raise PermissionError(f"directory must be mode 700: {directory}")
+
+    # Create the replacement file relative to the verified destination dir_fd.
+    for _ in range(100):
+        candidate = f".{basename}.tmp.{secrets.token_hex(8)}"
+        try:
+            tmp_fd = os.open(candidate, write_flags, 0o600, dir_fd=dir_fd)
+            tmp = candidate
+            break
+        except FileExistsError:
+            continue
+    if tmp_fd is None:
+        raise FileExistsError("could not create a unique temporary file")
+
+    while True:
+        chunk = os.read(src_fd, 65536)
+        if not chunk:
+            break
+        view = memoryview(chunk)
+        while view:
+            written = os.write(tmp_fd, view)
+            view = view[written:]
+    os.fchmod(tmp_fd, 0o600)
+    os.fsync(tmp_fd)
+    os.close(tmp_fd)
+    tmp_fd = None
+
+    os.replace(tmp, basename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    os.fsync(dir_fd)
+    tmp = None
+except Exception as exc:
+    print(f"SimpleOpenVPN: secure copy failed: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+finally:
+    if tmp_fd is not None:
+        os.close(tmp_fd)
+    if tmp is not None and dir_fd is not None:
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+    if dir_fd is not None:
+        os.close(dir_fd)
+    if src_fd is not None:
+        os.close(src_fd)
+' "$src" "$dir" "$base" "$openvpn_uid"
 }
 
 openvpn_init_state() {
   openvpn_prepare_dir "$openvpn_state_dir"
   openvpn_prepare_dir "$openvpn_auth_dir"
-  openvpn_prepare_dir "$openvpn_runtime_base"
-  openvpn_prepare_dir "$openvpn_runtime_dir"
 }
 
 openvpn_profile_hash() {
@@ -169,13 +287,6 @@ openvpn_profile_has_auth() {
 }
 
 openvpn_sync_runtime_auth() {
-  local target="${1:-}"
-  local auth_f
-  auth_f=$(openvpn_profile_auth_file "$target" 2>/dev/null || true)
-  if [[ -n "$auth_f" && -s "$auth_f" ]]; then
-    openvpn_secure_copy_file "$auth_f" "$openvpn_auth_file"
-    return 0
-  fi
   return 1
 }
 
@@ -220,7 +331,7 @@ openvpn_username() {
 }
 
 openvpn_has_auth() {
-  [[ -s "$openvpn_auth_file" ]] || openvpn_profile_has_auth
+  openvpn_profile_has_auth
 }
 
 openvpn_pid() {
