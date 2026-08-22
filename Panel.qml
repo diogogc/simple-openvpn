@@ -184,12 +184,11 @@ Panel {
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
                   Layout.fillWidth: true
+                }
+              }
+            }
+          }
         }
-      }
-    }
-  }
-}
-}
 
         PanelSeparator {
           width: parent.width
@@ -373,4 +372,5 @@ Panel {
       }
     }
   }
+}
 }
