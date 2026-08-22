@@ -4,6 +4,8 @@ SimpleOpenVPN is an Omarchy bar widget for running a single OpenVPN tunnel from 
 
 The plugin is intentionally small: it does not manage NetworkManager VPN profiles, systemd services, or multiple concurrent tunnels. It is built for users who already have `.ovpn` or `.conf` files and want a direct bar control for them.
 
+![SimpleOpenVPN panel](assets/simpleopenvpn-panel.png)
+
 ## Features
 
 - Add `.ovpn` or `.conf` profiles with a graphical file picker
