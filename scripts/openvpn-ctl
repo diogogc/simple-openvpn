@@ -155,8 +155,8 @@ set_config)
     echo "File unreadable: $new_conf" >&2
     exit 1
   fi
-	  printf '%s\n' "$new_conf" > "$openvpn_config_file"
-	  printf '%s\n' "$(dirname "$new_conf")" > "$openvpn_config_dir_file"
+	  openvpn_secure_write_line "$openvpn_config_file" "$new_conf"
+	  openvpn_secure_write_line "$openvpn_config_dir_file" "$(dirname "$new_conf")"
 	  openvpn_remember_profile "$new_conf"
 	  # Sync saved auth for this profile to runtime
 	  openvpn_sync_runtime_auth "$new_conf" || rm -f "$openvpn_auth_file"
@@ -170,7 +170,7 @@ set_config_dir)
     echo "Directory not found: $new_dir" >&2
     exit 1
   fi
-  printf '%s\n' "$new_dir" > "$openvpn_config_dir_file"
+  openvpn_secure_write_line "$openvpn_config_dir_file" "$new_dir"
   echo "ok"
   ;;
 
@@ -183,8 +183,8 @@ set_config_dir)
 	  fi
 
 	  if [[ -n "$file" && -r "$file" ]]; then
-	    printf '%s\n' "$file" > "$openvpn_config_file"
-	    printf '%s\n' "$(dirname "$file")" > "$openvpn_config_dir_file"
+	    openvpn_secure_write_line "$openvpn_config_file" "$file"
+	    openvpn_secure_write_line "$openvpn_config_dir_file" "$(dirname "$file")"
 	    openvpn_remember_profile "$file"
 	    openvpn_sync_runtime_auth "$file" || rm -f "$openvpn_auth_file"
 	    echo "$file"

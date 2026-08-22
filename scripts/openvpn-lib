@@ -48,37 +48,86 @@ openvpn_validate_file() {
   [[ "$owner" == "$openvpn_uid" ]] || openvpn_fail "file not owned by current user: $file" || return 1
 }
 
-openvpn_secure_truncate() {
-  local file="$1" dir
+openvpn_atomic_publish() {
+  local file="$1" dir base
   dir=$(dirname -- "$file")
+  base=$(basename -- "$file")
   openvpn_validate_dir "$dir" || return 1
-  openvpn_validate_file "$file" || return 1
-  umask 077
-  : > "$file"
-  chmod 600 -- "$file" 2>/dev/null || true
+
+  command -v python3 >/dev/null 2>&1 || openvpn_fail "python3 is required for secure file writes" || return 1
+  python3 -c '
+import os
+import secrets
+import sys
+
+directory, basename, destination = sys.argv[1:]
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+
+tmp = None
+fd = None
+try:
+    for _ in range(100):
+        candidate = os.path.join(directory, f".{basename}.tmp.{secrets.token_hex(8)}")
+        try:
+            fd = os.open(candidate, flags, 0o600)
+            tmp = candidate
+            break
+        except FileExistsError:
+            continue
+    if fd is None:
+        raise FileExistsError("could not create a unique temporary file")
+
+    with os.fdopen(fd, "wb", closefd=True) as handle:
+        fd = None
+        while True:
+            chunk = os.read(0, 65536)
+            if not chunk:
+                break
+            handle.write(chunk)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    os.replace(tmp, destination)
+    tmp = None
+except Exception as exc:
+    print(f"SimpleOpenVPN: secure write failed: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+finally:
+    if fd is not None:
+        os.close(fd)
+    if tmp is not None:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+' "$dir" "$base" "$file"
+}
+
+openvpn_secure_truncate() {
+  local file="$1"
+  printf '' | openvpn_atomic_publish "$file"
 }
 
 openvpn_secure_write_auth() {
-  local file="$1" username="$2" password="$3" dir
-  dir=$(dirname -- "$file")
-  openvpn_validate_dir "$dir" || return 1
-  openvpn_validate_file "$file" || return 1
-  umask 077
+  local file="$1" username="$2" password="$3"
   {
     printf '%s\n' "$username"
     printf '%s\n' "$password"
-  } > "$file"
-  chmod 600 -- "$file" 2>/dev/null || true
+  } | openvpn_atomic_publish "$file"
 }
 
 openvpn_secure_write_line() {
-  local file="$1" value="$2" dir
-  dir=$(dirname -- "$file")
-  openvpn_validate_dir "$dir" || return 1
-  openvpn_validate_file "$file" || return 1
-  umask 077
-  printf '%s\n' "$value" > "$file"
-  chmod 600 -- "$file" 2>/dev/null || true
+  local file="$1" value="$2"
+  printf '%s\n' "$value" | openvpn_atomic_publish "$file"
+}
+
+openvpn_secure_copy_file() {
+  local src="$1" dest="$2"
+  openvpn_validate_file "$src" || return 1
+  [[ -r "$src" ]] || return 1
+  cat -- "$src" | openvpn_atomic_publish "$dest"
 }
 
 openvpn_init_state() {
@@ -124,11 +173,7 @@ openvpn_sync_runtime_auth() {
   local auth_f
   auth_f=$(openvpn_profile_auth_file "$target" 2>/dev/null || true)
   if [[ -n "$auth_f" && -s "$auth_f" ]]; then
-    openvpn_validate_file "$auth_f" || return 1
-    openvpn_validate_dir "$openvpn_runtime_dir" || return 1
-    openvpn_validate_file "$openvpn_auth_file" || return 1
-    install -m 600 -- "$auth_f" "$openvpn_auth_file"
-    chmod 600 "$openvpn_auth_file" 2>/dev/null || true
+    openvpn_secure_copy_file "$auth_f" "$openvpn_auth_file"
     return 0
   fi
   return 1
@@ -148,15 +193,12 @@ openvpn_selected_dir() {
 }
 
 openvpn_remember_profile() {
-  local target="$1" tmp
+  local target="$1"
   [[ -n "$target" && -r "$target" ]] || return 1
-  tmp=$(mktemp)
   {
     [[ -r "$openvpn_profiles_file" ]] && sed '/^[[:space:]]*$/d' "$openvpn_profiles_file"
     printf '%s\n' "$target"
-  } | awk '!seen[$0]++' > "$tmp"
-  mv "$tmp" "$openvpn_profiles_file"
-  chmod 600 "$openvpn_profiles_file" 2>/dev/null || true
+  } | awk '!seen[$0]++' | openvpn_atomic_publish "$openvpn_profiles_file"
 }
 
 openvpn_known_profiles() {

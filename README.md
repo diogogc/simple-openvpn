@@ -24,7 +24,7 @@ SimpleOpenVPN is designed for Omarchy and its Quickshell-based shell.
 Install these packages before enabling the plugin:
 
 ```sh
-omarchy pkg add openvpn jq zenity
+omarchy pkg add openvpn jq zenity python
 ```
 
 It also uses tools that are normally present on Omarchy or Arch Linux:
@@ -36,6 +36,7 @@ It also uses tools that are normally present on Omarchy or Arch Linux:
 - `awk`
 - `grep`
 - `sed`
+- `python3`
 - GNU coreutils
 
 ## Install
@@ -43,7 +44,7 @@ It also uses tools that are normally present on Omarchy or Arch Linux:
 Install dependencies:
 
 ```sh
-omarchy pkg add openvpn jq zenity
+omarchy pkg add openvpn jq zenity python
 ```
 
 Add and enable the plugin:
