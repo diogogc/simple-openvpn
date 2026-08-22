@@ -76,6 +76,12 @@ Enter your VPN username and password, then click **Save for Profile**. Credentia
 
 Use the switch in the panel to connect or disconnect. You can also right-click the bar icon to toggle the VPN without opening the panel.
 
+## Remove
+
+```sh
+omarchy plugin remove io.github.diogogc.simple-openvpn
+```
+
 ## License
 
 MIT
