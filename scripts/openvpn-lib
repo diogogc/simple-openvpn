@@ -330,8 +330,6 @@ openvpn_selected_config() {
 openvpn_selected_dir() {
   if [[ -r "$openvpn_config_dir_file" ]]; then
     sed -n '1p' "$openvpn_config_dir_file"
-  else
-    printf '%s\n' "$HOME"
   fi
 }
 
