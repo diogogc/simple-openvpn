@@ -167,6 +167,9 @@ def fail(message):
     print(f"SimpleOpenVPN: {message}", file=sys.stderr)
     raise SystemExit(1)
 
+if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+    fail("pidfd support is required for privileged disconnect")
+
 def ensure_runtime_dir():
     # Runtime file invariant:
     #
@@ -521,32 +524,58 @@ def ensure_runtime_dir():
         fail(f"unsafe runtime directory: {runtime_dir}")
     return fd
 
-def is_target_openvpn(pid):
+def pidfd_current_pid(pidfd):
+    try:
+        with open(f"/proc/self/fdinfo/{pidfd}", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("Pid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return -1
+    return -1
+
+def open_target_openvpn_pidfd(pid):
     if not pid.isdecimal():
-        return False
+        return None
+    numeric_pid = int(pid)
+    try:
+        pidfd = os.pidfd_open(numeric_pid, 0)
+    except OSError:
+        return None
+
     proc = f"/proc/{pid}"
     try:
         with open(os.path.join(proc, "comm"), "r", encoding="utf-8") as handle:
             if handle.read().strip() != "openvpn":
-                return False
+                os.close(pidfd)
+                return None
         with open(os.path.join(proc, "cmdline"), "rb") as handle:
             argv = [arg.decode("utf-8", "replace") for arg in handle.read().split(b"\0") if arg]
     except OSError:
-        return False
+        os.close(pidfd)
+        return None
+
+    if pidfd_current_pid(pidfd) != numeric_pid:
+        os.close(pidfd)
+        return None
 
     for index, arg in enumerate(argv[:-1]):
         if arg == "--writepid" and argv[index + 1] == pid_path:
-            return True
-    return False
+            return pidfd
+    os.close(pidfd)
+    return None
 
 runtime_fd = ensure_runtime_dir()
 try:
     for pid in pids:
-        if is_target_openvpn(pid):
+        pidfd = open_target_openvpn_pidfd(pid)
+        if pidfd is not None:
             try:
-                os.kill(int(pid), signal.SIGTERM)
+                signal.pidfd_send_signal(pidfd, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            finally:
+                os.close(pidfd)
     if auth_name != "auth-user-pass":
         fail("unexpected auth file name")
     try:
