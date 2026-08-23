@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Security review acknowledgement:
+# HANCORE-linux reviewed the privileged OpenVPN launch path and identified
+# credential argv exposure, descriptor/path race conditions, and root execution
+# risks from user-owned OpenVPN profiles.
+# GitHub: https://github.com/HANCORE-linux
+
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/openvpn-lib
 source "$script_dir/openvpn-lib"
 openvpn_init_state
 
@@ -116,11 +123,27 @@ connect)
   config_dir=$(dirname "$config")
   auth_f=$(openvpn_profile_auth_file "$config" 2>/dev/null || true)
 
-  # OpenVPN needs privilege for tunnel setup. The privileged helper owns the
-  # runtime directory and uses descriptor-relative file operations so unprivileged
-  # users cannot redirect log/status/pid/auth paths with symlink swaps.
+  # Security boundary:
+  #
+  # OpenVPN needs root at startup to create/configure the tunnel device, but the
+  # selected .ovpn/.conf file and saved credentials are controlled by the desktop
+  # user. Treat every profile path, auth path, and config directive as untrusted
+  # until the privileged Python helper below validates it.
+  #
+  # This helper was hardened after security review from HANCORE-linux, who
+  # identified two important classes of bugs:
+  #
+  # 1. Secrets must not be passed as argv, because process command lines are
+  #    visible through normal process inspection interfaces.
+  # 2. A user-owned OpenVPN config must not be handed to a root OpenVPN process
+  #    without blocking directives that can load privileged code or redirect
+  #    privileged runtime files.
+  #
+  # OpenVPN reference:
+  # https://openvpn.net/community-docs/community-articles/openvpn-2-6-manual.html
   pkexec python3 - "$openvpn_uid" "$openvpn_gid" "$config" "$config_dir" "$auth_f" "$openvpn_runtime_dir" <<'PY'
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -146,9 +169,17 @@ def fail(message):
     raise SystemExit(1)
 
 def ensure_runtime_dir():
-    # Keep runtime files outside user-writable state. The directory is
-    # root-owned and executable-only for others, while readable outputs are
-    # created as mode 0600 for the requesting user.
+    # Runtime file invariant:
+    #
+    # The user must be able to read OpenVPN status/log/pid outputs, but must not
+    # be able to replace the directory with a symlink or race the privileged
+    # helper into truncating arbitrary root-visible paths. Keep runtime files in
+    # /run under a root-owned directory, then keep that directory open by fd for
+    # every create/replace operation below.
+    #
+    # The directory mode is 0711 so the user can traverse to files they own while
+    # other users cannot list the directory contents. Individual readable outputs
+    # are created mode 0600 and chowned to the requesting user.
     parent = os.path.dirname(runtime_dir)
     parent_stat = os.stat(parent)
     if parent_stat.st_uid != 0 or parent_stat.st_mode & 0o022:
@@ -180,8 +211,12 @@ def ensure_runtime_dir():
     return runtime_fd
 
 def open_user_file(path, required):
-    # User-supplied config/auth paths are opened once with O_NOFOLLOW and then
-    # passed forward by descriptor. The privileged process does not reopen them.
+    # Descriptor invariant:
+    #
+    # Open the user-supplied config/auth file exactly once with O_NOFOLLOW and
+    # validate the opened object with fstat(). After that, pass the descriptor
+    # forward. Do not validate by path and then reopen by path; HANCORE-linux
+    # correctly called out that pattern as check-then-use race-prone.
     if not path:
         if required:
             fail("missing required file path")
@@ -210,8 +245,12 @@ def open_user_file(path, required):
     return fd
 
 def secure_replace(dir_fd, name, data, mode, owner_uid, owner_gid):
-    # Publish runtime files under the verified root-owned runtime dir_fd. This
-    # prevents the privileged process from following user-controlled paths.
+    # Atomic runtime publishing:
+    #
+    # Create a fresh temp file below the already-verified runtime dir_fd, fsync
+    # the file, then rename it into place relative to the same directory fd. This
+    # avoids symlink following and directory replacement races while preserving an
+    # all-or-nothing update for auth/log/status/pid files.
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -260,9 +299,89 @@ def read_fd(fd):
         chunks.append(chunk)
     return b"".join(chunks)
 
+def validate_openvpn_config_fd(fd, label):
+    # Privileged config policy:
+    #
+    # OpenVPN accepts most command-line options inside config files, with the
+    # leading "--" removed. Because this profile is user-owned but later parsed by
+    # a root OpenVPN process, validate the already-open descriptor before launch.
+    #
+    # Reviewer contribution:
+    # HANCORE-linux noted that --script-security 1 does not block OpenVPN's
+    # "plugin" directive. The same trust-boundary reasoning applies to "iproute",
+    # management sockets, nested config files, script hooks, and runtime output
+    # directives. This denylist intentionally rejects those directives even if
+    # that means some advanced profiles are unsupported.
+    #
+    # References:
+    # - OpenVPN 2.6 manual, "OPTIONS": config files can contain command options.
+    # - OpenVPN 2.6 manual, "Plug-in Interface Options": plugin loads modules.
+    # - OpenVPN 2.6 manual, "Management Interface Options": management exposes
+    #   control over the OpenVPN process and must not be enabled by profiles here.
+    os.lseek(fd, 0, os.SEEK_SET)
+    in_inline = None
+    inline_options = {
+        "ca", "cert", "dh", "extra-certs", "http-proxy-user-pass", "key",
+        "pkcs12", "secret", "tls-auth", "tls-crypt", "tls-crypt-v2",
+    }
+    forbidden_directives = {
+        "auth-user-pass-verify", "client-connect", "client-disconnect",
+        "config", "down", "ipchange", "iproute", "learn-address", "log",
+        "log-append", "management", "management-client", "plugin",
+        "route-pre-down", "route-up", "script-security", "status", "tmp-dir",
+        "tls-verify", "up", "writepid",
+    }
+
+    config_file = None
+    try:
+        config_file = os.fdopen(os.dup(fd), "r", encoding="utf-8", errors="replace")
+        for lineno, raw in enumerate(config_file, 1):
+            line = raw.strip()
+            if not line or line.startswith("#") or line.startswith(";"):
+                continue
+
+            if in_inline is not None:
+                # Inline certificate/key blocks can contain arbitrary text. Do
+                # not interpret a word such as "plugin" inside certificate data
+                # as an OpenVPN directive.
+                if line.lower() == f"</{in_inline}>":
+                    in_inline = None
+                continue
+
+            if line.startswith("<") and line.endswith(">") and not line.startswith("</"):
+                tag = line[1:-1].strip().lower()
+                if tag in inline_options:
+                    in_inline = tag
+                continue
+
+            try:
+                parts = shlex.split(line, comments=True, posix=True)
+            except ValueError as exc:
+                fail(f"cannot parse OpenVPN config {label}:{lineno}: {exc}")
+            if not parts:
+                continue
+
+            directive = parts[0].lower().lstrip("-")
+            if directive in forbidden_directives:
+                fail(f"OpenVPN directive is not allowed: {directive} at {label}:{lineno}")
+            if directive in ("auth-user-pass", "askpass") and len(parts) > 1:
+                fail(f"OpenVPN credential file directive is not allowed: {directive} at {label}:{lineno}")
+            if directive == "setenv" and len(parts) >= 3 and parts[1].lower() == "opt":
+                deferred = parts[2].lower().lstrip("-")
+                if deferred in forbidden_directives or deferred in ("auth-user-pass", "askpass"):
+                    fail(f"deferred OpenVPN directive is not allowed: {deferred} at {label}:{lineno}")
+
+        if in_inline is not None:
+            fail(f"unterminated inline block <{in_inline}> in OpenVPN config {label}")
+    finally:
+        if config_file is not None:
+            config_file.close()
+        os.lseek(fd, 0, os.SEEK_SET)
+
 runtime_fd = ensure_runtime_dir()
 config_fd = open_user_file(config_path, True)
 auth_fd = open_user_file(auth_source, False)
+validate_openvpn_config_fd(config_fd, config_path)
 
 secure_replace(runtime_fd, log_name, b"", 0o600, uid, gid)
 secure_replace(runtime_fd, status_name, b"", 0o600, uid, gid)
@@ -279,7 +398,13 @@ args = [
 if auth_fd is not None:
     secure_replace(runtime_fd, auth_name, read_fd(auth_fd), 0o600, 0, 0)
     os.close(auth_fd)
-    # Keep credentials out of argv and ask OpenVPN not to cache them in memory.
+    # Credential invariant:
+    #
+    # Keep VPN credentials out of argv. The QML process sends credentials to the
+    # unprivileged shell helper over stdin, the helper stores them mode 0600, and
+    # this privileged launcher copies them into a root-owned mode 0600 runtime
+    # file for OpenVPN. --auth-nocache asks OpenVPN to discard credentials after
+    # use rather than keeping them in process memory longer than needed.
     args.extend(["--auth-user-pass", auth_path, "--auth-nocache"])
 else:
     try:
@@ -322,7 +447,10 @@ disconnect)
     pids=$(openvpn_pid 2>/dev/null || true)
   fi
   if [[ -n "$pids" ]]; then
-    pkexec /bin/sh -c 'auth_file=$1; shift; for pid in "$@"; do kill "$pid" 2>/dev/null || true; done; rm -f -- "$auth_file"' openvpn-widget "$openvpn_auth_file" $pids
+    mapfile -t pid_args <<<"$pids"
+    # shellcheck disable=SC2016
+    # The single-quoted script is evaluated by the privileged /bin/sh child.
+    pkexec /bin/sh -c 'auth_file=$1; shift; for pid in "$@"; do kill "$pid" 2>/dev/null || true; done; rm -f -- "$auth_file"' openvpn-widget "$openvpn_auth_file" "${pid_args[@]}"
   fi
   echo "disconnected"
   ;;

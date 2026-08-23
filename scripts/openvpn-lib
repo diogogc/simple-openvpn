@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 
+# Security review acknowledgement:
+# HANCORE-linux reviewed the file handling and called out validate-by-path then
+# reopen-by-path races in credential/profile state writes.
+# GitHub: https://github.com/HANCORE-linux
+
+# shellcheck disable=SC2034
+# This file is sourced by openvpn-ctl. These path/uid variables are library
+# outputs, so ShellCheck sees some of them as unused when checking this file by
+# itself even though openvpn-ctl consumes them after sourcing.
 openvpn_state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-openvpn"
 openvpn_runtime_dir="/run/simpleopenvpn-$(id -u)"
 openvpn_auth_dir="$openvpn_state_dir/auth"
@@ -13,6 +22,20 @@ openvpn_status_file="$openvpn_runtime_dir/openvpn.status"
 openvpn_log_file="$openvpn_runtime_dir/openvpn.log"
 openvpn_uid="$(id -u)"
 openvpn_gid="$(id -g)"
+
+# Security model for unprivileged state:
+#
+# Files below openvpn_state_dir are owned by the desktop user and may contain
+# sensitive profile metadata or saved VPN credentials. They are not trusted by
+# the privileged launcher until that launcher reopens and validates them with
+# O_NOFOLLOW and fstat().
+#
+# The helpers in this file still need race-safe writes because a compromised
+# same-user process can replace paths inside ~/.local/state while this plugin is
+# saving credentials or profile selections. HANCORE-linux specifically called
+# out validate-by-path then reopen-by-path patterns. The Python helpers below
+# therefore keep source and destination descriptors open and operate relative to
+# verified directory fds.
 
 openvpn_fail() {
   printf 'SimpleOpenVPN: %s\n' "$*" >&2
@@ -35,7 +58,7 @@ openvpn_prepare_dir() {
     openvpn_fail "refusing unsafe path: $dir" || return 1
   fi
   umask 077
-  mkdir -p -m 700 -- "$dir"
+  mkdir -p -- "$dir"
   chmod 700 -- "$dir"
   openvpn_validate_dir "$dir"
 }
@@ -54,9 +77,12 @@ openvpn_atomic_publish() {
   base=$(basename -- "$file")
 
   command -v python3 >/dev/null 2>&1 || openvpn_fail "python3 is required for secure file writes" || return 1
-  # Keep the validated directory open and perform all path operations relative
-  # to that descriptor. This avoids check-then-use races if the directory path
-  # is replaced after validation.
+  # Descriptor-relative publish:
+  #
+  # Open the destination directory with O_DIRECTORY/O_NOFOLLOW, validate the
+  # opened directory with fstat(), then create and rename the temp file relative
+  # to that same dir_fd. This closes the race where an attacker replaces the
+  # directory path after validation but before open/rename.
   python3 -c '
 import os
 import secrets
@@ -139,6 +165,9 @@ openvpn_secure_truncate() {
 
 openvpn_secure_write_auth() {
   local file="$1" username="$2" password="$3"
+  # Auth files are always written through openvpn_atomic_publish so they land as
+  # mode 0600 in a user-owned mode 0700 directory. They are copied into /run by
+  # the privileged launcher only after the selected profile is validated.
   {
     printf '%s\n' "$username"
     printf '%s\n' "$password"
@@ -157,9 +186,12 @@ openvpn_secure_copy_file() {
   base=$(basename -- "$dest")
 
   command -v python3 >/dev/null 2>&1 || openvpn_fail "python3 is required for secure file writes" || return 1
+  # Secure copy invariant:
+  #
   # Hold both the source file descriptor and destination directory descriptor
   # after validation. Copying from/to those descriptors avoids source reopens and
-  # destination directory replacement races.
+  # destination directory replacement races. This mirrors the openat/renameat
+  # style behavior requested by HANCORE-linux.
   python3 -c '
 import os
 import secrets
