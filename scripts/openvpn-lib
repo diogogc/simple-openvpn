@@ -386,11 +386,6 @@ openvpn_matching_pids() {
 }
 
 openvpn_is_running() {
-  local pid
-  pid=$(openvpn_pid 2>/dev/null || true)
-  if [[ "$pid" =~ ^[0-9]+$ ]]; then
-    openvpn_pid_is_openvpn "$pid" && return 0
-  fi
   [[ -n "$(openvpn_matching_pids)" ]]
 }
 
